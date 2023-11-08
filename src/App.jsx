@@ -3,12 +3,14 @@ import './App.css'
 import { useState, useEffect } from 'react'
 import { atom, useAtomValue, useSetAtom, useAtom } from 'jotai'
 import { secp256k1Compress, encodeAddress, blake2AsU8a } from "@polkadot/util-crypto"
-import { hexToU8a } from "@polkadot/util"
-import { hashMessage, recoverPublicKey, createPublicClient, http } from 'viem'
+import { ApiPromise, WsProvider, Keyring } from '@polkadot/api'
+import { hexToU8a, } from "@polkadot/util"
+import { waitReady } from '@polkadot/wasm-crypto'
+import { hashMessage, recoverPublicKey, createPublicClient, createWalletClient, http, custom } from 'viem'
 import { mainnet } from 'viem/chains'
 import { WagmiConfig, createConfig, useAccount, useWalletClient, useConnect } from 'wagmi'
 import { InjectedConnector } from 'wagmi/connectors/injected'
-import { ApiPromise, WsProvider } from '@polkadot/api'
+import { OnChainRegistry, options, PinkContractPromise, unsafeGetAbiFromGitHubRepoByCodeHash, etherAddressToCompactPubkey, signCertificate, unstable_signEip712Certificate } from '@phala/sdk'
 
 
 const config = createConfig({
@@ -239,6 +241,51 @@ function ActionButton() {
   )
 }
 
+function TestButton() {
+  const contractId = '0x1c56e6bc7d9fa27722ca166e7e852fb445ccdc26733bd967a031f283c52cc593'
+  return (
+    <button
+      onClick={async () => {
+        // Setup polkadot-js
+        await waitReady()
+        const apiPromise = new ApiPromise(options({ provider: new WsProvider('ws://10.0.0.120:19944'), noInitWarn: true }))
+        await apiPromise.isReady
+
+        // Providing basic interface integration with Phat Contract.
+        const registry = await OnChainRegistry.create(apiPromise)
+
+        // Fetching metadata from hosted verified contract metadata, then initial the instance.
+        const metadata = await unsafeGetAbiFromGitHubRepoByCodeHash('0x219e0f258c0de1f730790b3602dadf8bd897b3b7e3e5c2cbcc1a161760634945')
+        const contractKey = await registry.getContractKeyOrFail(contractId)
+        const contract = new PinkContractPromise(apiPromise, registry, metadata, contractId, contractKey)
+
+        // Calling contract with substrate wallet
+        {
+          const keyring = new Keyring({ type: 'sr25519' })
+          const pair = keyring.addFromUri('//Alice')
+          const certSubstrate = await signCertificate({ pair })
+          console.log('cert substrate', certSubstrate, pair.address)
+          const result1 = await contract.query.version(pair.address, { cert: certSubstrate })
+          console.log('result1', result1.output.toJSON())
+        }
+
+        // Calling contract with ethereum wallet
+        {
+          const client = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) })
+          const [address] = await client.requestAddresses()
+          const compactPubkey = await etherAddressToCompactPubkey(client, address)
+          const cert = await unstable_signEip712Certificate({ client, account: address, compactPubkey })
+          console.log('cert eip712', cert, address)
+          const result2 = await contract.query.version(address, { cert })
+          console.log('result2', result2.output.toJSON())
+        }
+      }}
+    >
+      test
+    </button>
+  )
+}
+
 
 function App() {
   return (
@@ -247,7 +294,8 @@ function App() {
         <h1 style={{fontSize: '20px'}}>viem/wagmi compatible wallet + Account Abstraction Pallet</h1>
         <p>A demo shown submit substrate transaction and sign with ethereum wallet</p>
       </header>
-      <ActionButton />
+      {/* <ActionButton /> */}
+      <TestButton />
     </WagmiConfig>
   )
 }

@@ -1,16 +1,15 @@
 import './App.css'
 
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { atom, useAtomValue, useSetAtom, useAtom } from 'jotai'
-import { secp256k1Compress, encodeAddress, blake2AsU8a } from "@polkadot/util-crypto"
-import { ApiPromise, WsProvider, Keyring } from '@polkadot/api'
-import { hexToU8a, } from "@polkadot/util"
-import { waitReady } from '@polkadot/wasm-crypto'
-import { hashMessage, recoverPublicKey, createPublicClient, createWalletClient, http, custom } from 'viem'
+import { ApiPromise, WsProvider } from '@polkadot/api'
+import { createPublicClient, createWalletClient, http, custom } from 'viem'
 import { mainnet } from 'viem/chains'
-import { WagmiConfig, createConfig, useAccount, useWalletClient, useConnect } from 'wagmi'
+import { WagmiConfig, createConfig, useAccount, useConnect } from 'wagmi'
 import { InjectedConnector } from 'wagmi/connectors/injected'
-import { OnChainRegistry, options, PinkContractPromise, unsafeGetAbiFromGitHubRepoByCodeHash, etherAddressToCompactPubkey, signCertificate, unstable_signEip712Certificate } from '@phala/sdk'
+import { OnChainRegistry, options, PinkContractPromise, unstable_WalletClientSigner } from '@phala/sdk'
+
+import abi from './metadata.json'
 
 
 const config = createConfig({
@@ -27,8 +26,7 @@ const apiPromiseAtom = atom(null)
 
 const accountAtom = atom(null)
 
-const substrateAddressAtom = atom(null)
-
+const signerAtom = atom(null)
 
 function ConnectButton() {
   const account = useAccount()
@@ -36,16 +34,14 @@ function ConnectButton() {
   const [apiPromise, setApiPromise] = useAtom(apiPromiseAtom)
   const { connect } = useConnect({ connector })
   const [substrateEndpoint, setSubstrateEndpoint] = useState('')
+  const [signer, setSigner] = useAtom(signerAtom)
 
-  useEffect(() => {
-    if (account && account.address) {
-      setAccount(account)
-    }
-  }, [account, setAccount])
-
-  if (account.isConnected && apiPromise) {
+  if (account.isConnected && apiPromise && signer) {
     return (
-      <button disabled>Connected</button>
+      <div style={{display: 'flex', flexDirection: 'column', gap: '8px', justifyContent: 'center', width: '100%'}}>
+        <button disabled>Connected</button>
+        <div>Address: {signer.address}</div>
+      </div>
     )
   }
   return (
@@ -58,15 +54,25 @@ function ConnectButton() {
         onChange={(e) => setSubstrateEndpoint(e.target.value)}
       />
       <button
-        disabled={!substrateEndpoint || (substrateEndpoint.indexOf('ws://') !== 0 && substrateEndpoint.indexOf('wss://') !== 0)}
+        disabled={!substrateEndpoint || (substrateEndpoint.indexOf('ws://') !== 0 && substrateEndpoint.indexOf('wss://') !== 0) || !account}
         onClick={async() => {
           connect()
           if (!apiPromise) {
-            const _apiPromise = new ApiPromise({ provider: new WsProvider(substrateEndpoint), noInitWarn: true })
+            const _apiPromise = new ApiPromise(options({ provider: new WsProvider(substrateEndpoint), noInitWarn: true }))
             await _apiPromise.isReady
             setApiPromise(_apiPromise)
+            const client = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) })
+            const [address] = await client.requestAddresses()
+            const signer = await unstable_WalletClientSigner.create(_apiPromise, client, { address })
+            setAccount({ address })
+            setSigner(signer)
           } else if (!apiPromise.isConnected) {
             await apiPromise.connect()
+            const client = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) })
+            const [address] = await client.requestAddresses()
+            const signer = await unstable_WalletClientSigner.create(apiPromise, client, { address })
+            setAccount({ address })
+            setSigner(signer)
           }
           if (account.address) {
             console.log('auth!')
@@ -84,15 +90,10 @@ function SubmitRemarkTx() {
   const [events, setEvents] = useState([])
   const [blockHash, setBlockHash] = useState('')
   const [isLoading, setIsLoading] = useState(false)
-  const account = useAtomValue(accountAtom)
-  const { data: walletClient } = useWalletClient()
   const apiPromise = useAtomValue(apiPromiseAtom)
-  if (!account || !apiPromise || !apiPromise.isConnected) {
-    return (
-      <div>
-        please connect wallet first.
-      </div>
-    )
+  const signer = useAtomValue(signerAtom)
+  if (!signer || !apiPromise || !apiPromise.isConnected) {
+    return null
   }
   return (
     <div style={{display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'start', width: '100%'}}>
@@ -109,17 +110,14 @@ function SubmitRemarkTx() {
           style={{flexGrow: 1}}
           onClick={async () => {
             setIsLoading(true)
-            const callData = apiPromise.tx.system.remarkWithEvent(message).inner.toHex()
-            const signature = await walletClient.signMessage({ account, message: callData })
-            const unsub = await apiPromise.tx.accountAbstraction.remoteCallFromEvmChain(account.address, callData, signature).send(async (result) => {
-              if (result.isInBlock || result.isFinalized) {
-                setEvents(result.events.map(i => i.toHuman()))
-                const blockHash = await apiPromise.rpc.chain.getBlockHash(result.blockNumber)
-                setBlockHash(blockHash.toHex())
-                unsub()
-                setIsLoading(false)
-              }
-            })
+            try {
+              const result = await signer.send(apiPromise.tx.system.remarkWithEvent(message))
+              setEvents(result.events.map(i => i.toHuman()))
+              const blockHash = await apiPromise.rpc.chain.getBlockHash(result.blockNumber)
+              setBlockHash(blockHash.toHex())
+            } finally {
+              setIsLoading(false)
+            }
           }}
         >
           {isLoading ? 'Please wait...' : 'Send'}
@@ -143,67 +141,14 @@ function SubmitRemarkTx() {
   )
 }
 
-function SubStrateAddress() {
-  const [substrateAddr, setSubStrate] = useAtom(substrateAddressAtom)
-  const [isLoading, setIsLoading] = useState(false)
-  const account = useAtomValue(accountAtom)
-  const { data: walletClient } = useWalletClient()
-  const apiPromise = useAtomValue(apiPromiseAtom)
-  if (!account || !apiPromise || !apiPromise.isConnected) {
-    return (
-      <div>
-        Please connect wallet first.
-      </div>
-    )
-  }
-  return (
-    <div>
-      <button
-        disabled={isLoading}
-        onClick={async () => {
-          setIsLoading(true)
-          const callData = apiPromise.tx.system.remarkWithEvent('mock').inner.toHex()
-          const signature = await walletClient.signMessage({ account, message: callData })
-          const hash = hashMessage(callData)
-          const recoveredPublicKey = await recoverPublicKey({ hash, signature })
-          const compressedEvmPublicKey = secp256k1Compress(hexToU8a(recoveredPublicKey))
-          const subAddressFromEvmPublicKey = encodeAddress(blake2AsU8a(compressedEvmPublicKey), 42)
-          setSubStrate(subAddressFromEvmPublicKey)
-          setIsLoading(false)
-        }}
-      >
-        Get Substrate address
-      </button>
-      {substrateAddr ? (
-        <div>
-          <code>{substrateAddr}</code>
-        </div>
-      ): null}
-    </div>
-  )
-}
-
 function QueryBalance() {
-  const account = useAtomValue(accountAtom)
-  const substrateAddress = useAtomValue(substrateAddressAtom)
+  const signer = useAtomValue(signerAtom)
   const apiPromise = useAtomValue(apiPromiseAtom)
   const [isLoading, setIsLoading] = useState(false)
   const [balance, setBalance] = useState(null)
 
-  if (!account || !apiPromise || !apiPromise.isConnected) {
-    return (
-      <div>
-        please connect wallet first.
-      </div>
-    )
-  }
-
-  if (!substrateAddress) {
-    return (
-      <div>
-        please get your substrate address first.
-      </div>
-    )
+  if (!signer || !apiPromise || !apiPromise.isConnected) {
+    return null
   }
 
   return (
@@ -212,8 +157,7 @@ function QueryBalance() {
         disabled={isLoading}
         onClick={async () => {
           setIsLoading(true)
-          console.log(substrateAddress)
-          const result = await apiPromise.query.system.account(substrateAddress)
+          const result = await apiPromise.query.system.account(signer.address)
           setBalance(result.toHuman())
           setIsLoading(false)
         }}
@@ -229,73 +173,132 @@ function QueryBalance() {
   )
 }
 
-
-function ActionButton() {
+function TestContractTrx({ contractId }) {
+  const [message, setMessage] = useState('')
+  const [events, setEvents] = useState([])
+  const [blockHash, setBlockHash] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const apiPromise = useAtomValue(apiPromiseAtom)
+  const signer = useAtomValue(signerAtom)
+  if (!signer || !apiPromise || !apiPromise.isConnected) {
+    return null
+  }
   return (
-    <div style={{display: 'flex', flexDirection: 'column', gap: '8px', justifyContent: 'center'}}>
-      <ConnectButton />
-      <SubStrateAddress />
-      <QueryBalance />
-      <SubmitRemarkTx />
+    <div style={{display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'start', width: '100%'}}>
+      <div style={{display: 'flex', flexDirection: 'row', gap: '8px', justifyContent: 'center', width: '100%'}}>
+        <input
+          type="text"
+          placeholder="Enter a badge name."
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          style={{flexGrow: 1, padding: '4px 6px'}}
+        />
+        <button
+          disabled={!message || isLoading}
+          style={{flexGrow: 1}}
+          onClick={async () => {
+            setIsLoading(true)
+            try {
+              // Providing basic interface integration with Phat Contract.
+              const registry = await OnChainRegistry.create(apiPromise)
+              const contractKey = await registry.getContractKeyOrFail(contractId)
+              const contract = new PinkContractPromise(apiPromise, registry, abi, contractId, contractKey)
+              const result = await contract.send.newBadge({ unstable_signer: signer }, message)
+              setEvents(result.events.map(i => i.toHuman()))
+              const blockHash = await apiPromise.rpc.chain.getBlockHash(result.blockNumber)
+              setBlockHash(blockHash.toHex())
+              setMessage('')
+            } finally {
+              setIsLoading(false)
+            }
+          }}
+        >
+          {isLoading ? 'Please wait...' : 'Create'}
+        </button>
+      </div>
+      {!isLoading && blockHash ? (
+        <div><a href={`https://polkadot.js.org/apps/?rpc=ws://10.0.0.120:19944#/explorer/query/${blockHash}`} target="_blank">View on Polkadot App</a></div>
+      ) : null}
+      {!isLoading && events.length ? (
+        <div>
+          <ul style={{display: 'flex', flexDirection: 'column', alignItems: 'start', margin: '0', paddingLeft: '16px'}}>
+            {events.map((event, idx) => (
+              <li key={idx}>
+                <code>{event.event.section}.{event.event.method}</code>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   )
 }
 
-function TestButton() {
-  const contractId = '0x1c56e6bc7d9fa27722ca166e7e852fb445ccdc26733bd967a031f283c52cc593'
+function TestOffchainQuery({ contractId }) {
+  const [result, setResult] = useState('')
+  const apiPromise = useAtomValue(apiPromiseAtom)
+  const signer = useAtomValue(signerAtom)
+  const [cacheCert, setCacheCert] = useState(null)
+  if (!signer || !apiPromise || !apiPromise.isConnected) {
+    return null
+  }
   return (
-    <button
-      onClick={async () => {
-        // Setup polkadot-js
-        await waitReady()
-        const apiPromise = new ApiPromise(options({ provider: new WsProvider('ws://10.0.0.120:19944'), noInitWarn: true }))
-        await apiPromise.isReady
-
-        // Providing basic interface integration with Phat Contract.
-        const registry = await OnChainRegistry.create(apiPromise)
-
-        // Fetching metadata from hosted verified contract metadata, then initial the instance.
-        const metadata = await unsafeGetAbiFromGitHubRepoByCodeHash('0x219e0f258c0de1f730790b3602dadf8bd897b3b7e3e5c2cbcc1a161760634945')
-        const contractKey = await registry.getContractKeyOrFail(contractId)
-        const contract = new PinkContractPromise(apiPromise, registry, metadata, contractId, contractKey)
-
-        // Calling contract with substrate wallet
-        {
-          const keyring = new Keyring({ type: 'sr25519' })
-          const pair = keyring.addFromUri('//Alice')
-          const certSubstrate = await signCertificate({ pair })
-          console.log('cert substrate', certSubstrate, pair.address)
-          const result1 = await contract.query.version(pair.address, { cert: certSubstrate })
-          console.log('result1', result1.output.toJSON())
-        }
-
-        // Calling contract with ethereum wallet
-        {
-          const client = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) })
-          const [address] = await client.requestAddresses()
-          const compactPubkey = await etherAddressToCompactPubkey(client, address)
-          const cert = await unstable_signEip712Certificate({ client, account: address, compactPubkey })
-          console.log('cert eip712', cert, address)
-          const result2 = await contract.query.version(address, { cert })
-          console.log('result2', result2.output.toJSON())
-        }
-      }}
-    >
-      test
-    </button>
+    <div style={{display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'start', width: '100%'}}>
+      <button
+        onClick={async () => {
+          // Providing basic interface integration with Phat Contract.
+          const registry = await OnChainRegistry.create(apiPromise)
+          const contractKey = await registry.getContractKeyOrFail(contractId)
+          const contract = new PinkContractPromise(apiPromise, registry, abi, contractId, contractKey)
+          let cert = cacheCert
+          if (!cacheCert) {
+            cert = await signer.signCertificate()
+            setCacheCert(cert)
+          }
+          const { output } = await contract.query.getTotalBadges(cert.address, { cert })
+          setResult(output.toJSON())
+        }}
+      >
+        test
+      </button>
+      {result ? (
+        <div>
+          Total badges: <code>{result}</code>
+        </div>
+      ) : null}
+    </div>
   )
 }
 
 
 function App() {
+  const contractId = '0xff6a19cc77bc893ef950eede0c271460952a426bfb9b18580e0b0729db999268'
   return (
     <WagmiConfig config={config}>
       <header>
         <h1 style={{fontSize: '20px'}}>viem/wagmi compatible wallet + Account Abstraction Pallet</h1>
         <p>A demo shown submit substrate transaction and sign with ethereum wallet</p>
       </header>
-      {/* <ActionButton /> */}
-      <TestButton />
+      <ConnectButton />
+      <hr />
+      <div style={{display: 'flex', flexDirection: 'column', gap: '8px', justifyContent: 'center'}}>
+        <div>
+          <h4>Query store</h4>
+          <QueryBalance />
+        </div>
+        <div>
+          <h4>Send extrinct</h4>
+          <SubmitRemarkTx />
+        </div>
+        <div>
+          <h4>Send contract transaction</h4>
+          <TestContractTrx contractId={contractId} />
+        </div>
+        <div>
+          <h4>Send contract query</h4>
+          <TestOffchainQuery contractId={contractId} />
+        </div>
+      </div>
     </WagmiConfig>
   )
 }

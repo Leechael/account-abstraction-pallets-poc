@@ -7,7 +7,7 @@ import { createPublicClient, createWalletClient, http, custom } from 'viem'
 import { mainnet } from 'viem/chains'
 import { WagmiConfig, createConfig, useAccount, useConnect } from 'wagmi'
 import { InjectedConnector } from 'wagmi/connectors/injected'
-import { OnChainRegistry, options, PinkContractPromise, unstable_WalletClientSigner } from '@phala/sdk'
+import { OnChainRegistry, options, PinkContractPromise, unstable_EvmAccountMappingProvider } from '@phala/sdk'
 
 import abi from './metadata.json'
 
@@ -63,14 +63,14 @@ function ConnectButton() {
             setApiPromise(_apiPromise)
             const client = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) })
             const [address] = await client.requestAddresses()
-            const signer = await unstable_WalletClientSigner.create(_apiPromise, client, { address })
+            const signer = await unstable_EvmAccountMappingProvider.create(_apiPromise, client, { address })
             setAccount({ address })
             setSigner(signer)
           } else if (!apiPromise.isConnected) {
             await apiPromise.connect()
             const client = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) })
             const [address] = await client.requestAddresses()
-            const signer = await unstable_WalletClientSigner.create(apiPromise, client, { address })
+            const signer = await unstable_EvmAccountMappingProvider.create(apiPromise, client, { address })
             setAccount({ address })
             setSigner(signer)
           }
@@ -270,9 +270,42 @@ function TestOffchainQuery({ contractId }) {
   )
 }
 
+const proven_script = '(()=>{"use strict";var t={730:(t,e)=>{}},e={};function r(n){var a=e[n];if(void 0!==a)return a.exports;var o=e[n]={exports:{}};return t[n](o,o.exports,r),o.exports}(()=>{r(730);function t(t){for(var e="",r=0;r<t.length;r++)e+=t.charCodeAt(r).toString(16);return"0x"+e}globalThis.scriptOutput=function(e,r,n){if(!n)return 0;const a=JSON.stringify({query:`\n      query MyQuery {\n        Socials(\n          input: {filter: {identity: {_eq: "${n}"}}, blockchain: ethereum}\n        ) {\n          Social {\n            dappName\n            profileName\n            profileDisplayName\n            userAddress\n            userAssociatedAddresses\n          }\n        }\n      }\n    `}),o=pink.httpRequest({url:"https://api.airstack.xyz/gql",method:"POST",headers:{"Content-Type":"application/json","User-Agent":"phat-contract",Authorization:"3a41775a358a4cb99ca9a29c1f6fc486"},body:t(a),returnTextBody:!0});if(200!==o.statusCode)throw console.log("Bad Request:",o.statusCode),new Error("Bad Request");const s=JSON.parse(o.body);return(s?.data?.Socials?.Social||[]).length>0?1e3:100}.apply(null,globalThis.scriptArgs)})()})();'
+
+function CheckEvmAccountCall({ contractId }) {
+  const apiPromise = useAtomValue(apiPromiseAtom)
+  const signer = useAtomValue(signerAtom)
+  const [cacheCert, setCacheCert] = useState(null)
+  if (!signer || !apiPromise || !apiPromise.isConnected) {
+    return null
+  }
+	return (
+		<button
+      onClick={async () => {
+        console.log('requested address', signer.compactPubkey)
+        // Providing basic interface integration with Phat Contract.
+        const registry = await OnChainRegistry.create(apiPromise)
+        const contractKey = await registry.getContractKeyOrFail(contractId)
+        const contract = new PinkContractPromise(apiPromise, registry, abi, contractId, contractKey)
+        let cert = cacheCert
+        if (!cacheCert) {
+          cert = await signer.signCertificate()
+          setCacheCert(cert)
+        }
+        // const { output } = await contract.query.isEcdsaAccountCall(cert.address, { cert }, signer.compactPubkey, signer.proxiedEvmAccount.address)
+        const { output } = await contract.query.testProvenScript(cert.address, { cert }, proven_script, { compressedPubkey: signer.compactPubkey, addres: signer.proxiedEvmAccount.address})
+        console.log(output.toHuman())
+        // setResult(output.toJSON())
+      }}
+    >
+      Check EVM Account Call
+    </button>
+	)
+}
+
 
 function App() {
-  const contractId = '0xff6a19cc77bc893ef950eede0c271460952a426bfb9b18580e0b0729db999268'
+  const contractId = '0x20c5d09ee550860d3e02ca06bb6b4a1db006bd16d3b6b32b7b8b22deb7c098ef'
   return (
     <WagmiConfig config={config}>
       <header>
@@ -297,6 +330,10 @@ function App() {
         <div>
           <h4>Send contract query</h4>
           <TestOffchainQuery contractId={contractId} />
+        </div>
+        <div>
+          <h4>EVM Account Check</h4>
+          <CheckEvmAccountCall contractId={contractId} />
         </div>
       </div>
     </WagmiConfig>
